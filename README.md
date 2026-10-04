@@ -12,6 +12,8 @@ optionally with perfectly synced subtitles that can be embedded or burned in.
 - **Perfectly synced subtitles**: cues are re-timed to each segment's *actual* video
   content, so they line up regardless of where the cut lands
 - Automatically detect video duration, keyframes, and `.srt` files
+- **Batch processing**: cut many videos in one run — pass a list, scan a folder, or
+  both; each video gets its own output subfolder and a bad file never stops the batch
 - Fast by default: video/audio are stream-copied (no re-encode) unless you burn
 - Keyframe index is cached, so re-runs into the same output directory are fast
 - Works with 1080p/4K sources and multi-channel audio
@@ -30,6 +32,49 @@ python video_cutter.py input.mp4 output_dir -d 120
 ```
 
 Stream-copies the video into 120-second segments. Fastest option, no re-encoding.
+
+### Cutting multiple videos (batch)
+
+Pass several files at once, or point at a folder. Each video gets **its own
+subfolder** inside the output directory, so files that share a name never collide.
+
+```
+# Explicit list
+python video_cutter.py ep1.mp4 ep2.mkv ep3.mov -o output -d 120 --burn
+
+# Whole folder
+python video_cutter.py --input-dir "F:\Movies\Season 1" -o output -d 120
+
+# Folder + subfolders (season packs, nested folders)
+python video_cutter.py --input-dir "F:\Movies\Mobland" -o output -d 120 --recursive
+
+# Mix explicit files with a folder scan
+python video_cutter.py extra.mp4 --input-dir "F:\Movies\Season 2" -o output -d 120
+```
+
+Recognised video extensions: `mp4, mkv, mov, avi, m4v, webm, mp4v, ts, mts, m2ts,
+flv, wmv, mpg, mpeg, vob`.
+
+**Subtitles are resolved per video.** An `.srt` sitting next to a video is picked up
+automatically for that video; videos without one are simply cut without subtitles.
+So a mixed batch needs no extra flags — pass `--burn` (or not) once and it applies
+to the whole batch.
+
+Output looks like this (note the `_2` suffix that prevents overwriting):
+
+```
+output/
+├── Mobland S01E01/
+│   ├── Mobland S01E01_part1.mp4
+│   ├── Mobland S01E01_part1.srt
+│   └── ...
+└── Mobland S01E01_2/       <- same name, different source folder
+    └── ...
+```
+
+**A failing file doesn't stop the batch.** The run continues with the remaining
+videos, prints an `OK`/`FAILED` line per file, and finishes with a summary. The exit
+code is non-zero if anything failed, so you can spot problems in a script.
 
 ### Cutting WITH subtitles (embedded track)
 
@@ -87,16 +132,21 @@ python video_cutter.py input.mp4 output_dir -d 120 --no-mux
 
 | Option            | Description                                                                 |
 |-------------------|-----------------------------------------------------------------------------|
-| `input_file`      | Path to the input video file                                                |
-| `output_dir`      | Directory to save the output segments (created if missing)                  |
+| `paths`           | One or more input video files (omit when using `--input-dir`)               |
+| `-o, --output-dir DIR` | Root output directory; each video gets its own subfolder. Required for batches |
+| `--input-dir DIR` | Scan this directory for video files and add them to the batch               |
+| `--recursive`     | With `--input-dir`, also scan subdirectories                                 |
 | `-d, --duration`  | Duration of each segment in seconds (default: 120)                          |
-| `--subtitle FILE` | Path to an `.srt` file; otherwise auto-detected next to the video           |
-| `--burn`          | Hardcode subtitles onto the video frames (re-encodes; for social media)      |
+| `--subtitle FILE` | Path to an `.srt` file (single input only); otherwise auto-detected per video |
 | `--no-mux`        | Write standalone `.srt` files per segment but do not embed them             |
+| `--burn`          | Hardcode subtitles onto the video frames (re-encodes; for social media)      |
 | `--encoder`       | `auto` (default, tries Intel Quick Sync then libx264), `libx264`, `h264_qsv` |
 | `--crf`           | Video quality for `--burn` (lower = better, default: 18)                    |
 | `--font-size`     | Subtitle font size in pixels for `--burn` (default: 18)                     |
 | `--style`         | Full libass `force_style` override for `--burn`                             |
+
+> The single-file form `python video_cutter.py input.mp4 output_dir -d 120` still
+> works exactly as before.
 
 ## How subtitle sync works
 
@@ -131,6 +181,13 @@ Audio is stream-copied and stays in sync with the video.
 - Only `.srt` subtitle files are supported currently.
 - Only `.srt` is auto-detected; name it after the video (e.g. `movie.srt` next to
   `movie.mp4`) or pass `--subtitle` explicitly.
+- **Subtitle matching is deliberately conservative.** A video picks up an `.srt` only
+  if the filename matches its own stem, or if it is the *only* video and *only* `.srt`
+  in that folder. This prevents a video from silently picking up another video's
+  subtitles during a batch. If a folder holds several `.srt` files with no match, the
+  video is cut without subtitles and a note is printed — use `--subtitle` to be explicit.
+- `--subtitle` applies to a single input only; using it with a batch is rejected with a
+  clear message instead of guessing.
 - Subtitles already embedded in the source video are **not** carried over. The script
   maps only the video and audio streams (`-map 0:v -map 0:a`) and handles subtitles
   itself, so your `.srt` is the single source of truth and you never end up with two
@@ -141,3 +198,6 @@ Audio is stream-copied and stays in sync with the video.
   keyframe pre-roll and audio padding. This is inherent to lossless stream copying.
 - `--burn` re-encodes only the segments that actually contain cues, so it is much
   faster than a full re-encode of the whole video.
+- In a batch, every video gets an output subfolder named after it. If two inputs share
+  a filename, the second gets a `_2` suffix. **Output paths therefore differ from the
+  old flat layout** if you have other tooling pointed at them.

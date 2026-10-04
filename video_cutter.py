@@ -183,9 +183,20 @@ def find_subtitle_file(input_file, explicit=None):
         if os.path.splitext(os.path.basename(path))[0].lower().startswith(base):
             print(f"Auto-detected subtitle file: {path}")
             return path
-    sub = srt_files[0]
-    print(f"Auto-detected subtitle file: {sub}")
-    return sub
+
+    # Fall back to a lone .srt only when this folder holds a single video,
+    # otherwise we would silently pair a video with the wrong subtitles.
+    sibling_videos = [name for name in entries
+                      if os.path.splitext(name)[1].lower() in VIDEO_EXTENSIONS
+                      and os.path.isfile(os.path.join(directory, name))]
+    if len(srt_files) == 1 and len(sibling_videos) == 1:
+        sub = srt_files[0]
+        print(f"Auto-detected subtitle file: {sub}")
+        return sub
+
+    print(f"Multiple .srt files next to {os.path.basename(input_file)} but none match its "
+          f"name; cutting without subtitles (pass --subtitle to choose explicitly).")
+    return None
 
 
 DEFAULT_ASS_STYLE = "FontName=Arial,FontSize={size},PrimaryColour=&H00FFFFFF,Outline=1,Shadow=0"
@@ -312,8 +323,9 @@ def cut_video(input_file, output_dir, segment_duration, subtitle_file, no_mux,
     print(f"Getting video information: {input_file}")
     duration = probe_duration(input_file)
     if not duration:
-        print("Could not determine video duration.")
-        return
+        raise FFmpegError(
+            f"Could not determine video duration (file may be corrupt or not a video): "
+            f"{input_file}")
     print(f"Video duration: {duration:.2f} seconds")
 
     num_segments = math.ceil(duration / segment_duration)
@@ -375,17 +387,116 @@ def cut_video(input_file, output_dir, segment_duration, subtitle_file, no_mux,
     print("Video cutting completed!")
 
 
+VIDEO_EXTENSIONS = {
+    ".mp4", ".mkv", ".mov", ".avi", ".m4v", ".webm", ".mp4v",
+    ".ts", ".mts", ".m2ts", ".flv", ".wmv", ".mpg", ".mpeg", ".vob",
+}
+
+
+def resolve_inputs(paths, input_dir=None, recursive=False):
+    inputs = []
+    seen = set()
+
+    def add(path):
+        key = os.path.normcase(os.path.abspath(path))
+        if key in seen:
+            return
+        seen.add(key)
+        inputs.append(path)
+
+    for path in paths or []:
+        if not os.path.isfile(path):
+            raise FFmpegError(f"Input file not found: {path}")
+        add(path)
+
+    if input_dir:
+        if not os.path.isdir(input_dir):
+            raise FFmpegError(f"Input directory not found: {input_dir}")
+        if recursive:
+            walker = os.walk(input_dir)
+        else:
+            walker = [(input_dir, [], os.listdir(input_dir))]
+        found = []
+        for root, _dirs, names in walker:
+            for name in names:
+                if os.path.splitext(name)[1].lower() in VIDEO_EXTENSIONS:
+                    found.append(os.path.join(root, name))
+        for path in sorted(found):
+            add(path)
+        print(f"Found {len(found)} video file(s) in {input_dir}"
+              + (" (recursive)" if recursive else ""))
+
+    if not inputs:
+        raise FFmpegError("No input videos. Pass video paths and/or --input-dir.")
+    return inputs
+
+
+def plan_output_dir(base_dir, input_file, used):
+    stem = os.path.splitext(os.path.basename(input_file))[0] or "video"
+    name = stem
+    n = 2
+    while name.lower() in used:
+        name = f"{stem}_{n}"
+        n += 1
+    used.add(name.lower())
+    return os.path.join(base_dir, name)
+
+
+def run_batch(inputs, output_dir, args, force_style):
+    used = set()
+    results = []
+    total = len(inputs)
+
+    for i, input_file in enumerate(inputs, 1):
+        target = plan_output_dir(output_dir, input_file, used)
+        print(f"\n=== [{i}/{total}] {os.path.basename(input_file)} -> {target} ===")
+
+        try:
+            subtitle_file = find_subtitle_file(input_file, args.subtitle)
+            if subtitle_file and not subtitle_file.lower().endswith(".srt"):
+                print("Only .srt subtitle files are supported right now.")
+                subtitle_file = None
+            cut_video(input_file, target, args.duration, subtitle_file, args.no_mux,
+                      burn=args.burn, encoder=args.encoder, crf=args.crf,
+                      force_style=force_style)
+            results.append((input_file, None))
+            print(f"--- OK: {os.path.basename(input_file)}")
+        except FFmpegError as exc:
+            reason = str(exc).strip().splitlines()[-1][:200]
+            results.append((input_file, reason))
+            print(f"--- FAILED: {os.path.basename(input_file)}: {reason}")
+        except Exception as exc:
+            reason = f"{type(exc).__name__}: {exc}"[:200]
+            results.append((input_file, reason))
+            print(f"--- FAILED: {os.path.basename(input_file)}: {reason}")
+
+    failed = [(f, r) for f, r in results if r]
+    print("\n" + "=" * 60)
+    print(f"Batch summary: {len(results) - len(failed)} succeeded, {len(failed)} failed")
+    for path, reason in failed:
+        print(f"  FAILED {os.path.basename(path)}: {reason}")
+    print("=" * 60)
+    return 1 if failed else 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Cut a video into segments of specified duration using FFmpeg, "
                     "optionally with perfectly synced subtitles")
-    parser.add_argument("input_file", help="Path to the input video file")
-    parser.add_argument("output_dir", help="Directory to save the output segments")
+    parser.add_argument("paths", nargs="*",
+                        help="One or more input video files (omit when using --input-dir)")
+    parser.add_argument("-o", "--output-dir", metavar="DIR",
+                        help="Root output directory; each video gets its own subfolder. "
+                             "Required unless two paths are given (legacy 'input output' form)")
+    parser.add_argument("--input-dir", metavar="DIR",
+                        help="Scan this directory for video files and add them to the batch")
+    parser.add_argument("--recursive", action="store_true",
+                        help="With --input-dir, also scan subdirectories")
     parser.add_argument("-d", "--duration", type=int, default=120,
                         help="Duration of each segment in seconds (default: 120 seconds = 2 minutes)")
     parser.add_argument("--subtitle", metavar="FILE",
-                        help="Path to an .srt subtitle file. If omitted, an .srt next to the "
-                             "input video is auto-detected")
+                        help="Path to an .srt subtitle file (single input only). If omitted, "
+                             "an .srt next to each input video is auto-detected")
     parser.add_argument("--no-mux", action="store_true",
                         help="Write standalone .srt files per segment but do not embed "
                              "subtitles into the video files")
@@ -407,22 +518,45 @@ def main():
 
     if not check_ffmpeg():
         print("FFmpeg is not installed or not in PATH.")
-        print("Please install FFmpeg from https://ffmpeg.org/download.html")
+        print("Please install it from https://ffmpeg.org/download.html")
         print("Make sure to add it to your system PATH.")
         sys.exit(1)
 
-    subtitle_file = find_subtitle_file(args.input_file, args.subtitle)
-    if subtitle_file and not subtitle_file.lower().endswith(".srt"):
-        print("Only .srt subtitle files are supported right now.")
-        subtitle_file = None
+    paths = list(args.paths)
+    output_dir = args.output_dir
+
+    if output_dir is None:
+        # Legacy single-input form: 'input output_dir'. The output dir may not
+        # exist yet, so fall back to "second arg isn't an existing video file".
+        if len(paths) == 2 and (os.path.isdir(paths[1])
+                                or not os.path.isfile(paths[1])):
+            output_dir = paths[1]
+            paths = paths[:1]
+        else:
+            print("Missing output directory.")
+            print("  Multiple inputs: use -o/--output-dir, e.g.")
+            print("    python video_cutter.py a.mp4 b.mkv -o out -d 120")
+            print("  Legacy single input: python video_cutter.py a.mp4 out -d 120")
+            sys.exit(2)
+
+    if args.subtitle and (len(paths) > 1 or args.input_dir):
+        print("--subtitle takes a single .srt path and applies to one input only.")
+        print("For a batch, place a matching .srt next to each video so it is "
+              "auto-detected, or run the batch one video at a time.")
+        sys.exit(2)
 
     if args.style:
         force_style = args.style
     else:
         force_style = DEFAULT_ASS_STYLE.format(size=args.font_size)
 
-    cut_video(args.input_file, args.output_dir, args.duration, subtitle_file, args.no_mux,
-              burn=args.burn, encoder=args.encoder, crf=args.crf, force_style=force_style)
+    try:
+        inputs = resolve_inputs(paths, args.input_dir, args.recursive)
+    except FFmpegError as exc:
+        print(exc)
+        sys.exit(2)
+
+    sys.exit(run_batch(inputs, output_dir, args, force_style))
 
 
 if __name__ == "__main__":
